@@ -123,16 +123,25 @@ clv_segmented.write.mode("overwrite") \
 # RFM (Recency, Frequency, Monetary)
 # -----------------------------------------
 
-from pyspark.sql.functions import max as _max, count as _count
+from pyspark.sql.functions import (
+    max as _max,
+    count as _count,
+    sum as _sum,
+    current_date,
+    datediff,
+    when,
+    round,
+    col
+)
 
-# Monetary = total revenue per user
+# Monetary = total revenue per user (last 12 months)
 monetary = (
     clv_daily
     .groupBy("user_id")
     .agg(_sum("daily_revenue").alias("monetary"))
 )
 
-# Frequency = number of order days per user
+# Frequency = number of order days per user (last 12 months)
 frequency = (
     clv_daily
     .groupBy("user_id")
@@ -146,13 +155,21 @@ last_order = (
     .agg(_max("order_date").alias("last_order_date"))
 )
 
-from pyspark.sql.functions import current_date, datediff
-
+# Build RFM base
 rfm = (
     last_order
     .join(frequency, "user_id")
     .join(monetary, "user_id")
-    .withColumn("recency", datediff(current_date(), col("last_order_date")))
+    .withColumn("recency_days", datediff(current_date(), col("last_order_date")))
+)
+
+# RFM Segmentation
+rfm = rfm.withColumn(
+    "rfm_segment",
+    when((col("recency_days") <= 30) & (col("frequency") >= 10) & (col("monetary") >= 500), "VIP")
+    .when((col("recency_days") <= 30) & (col("frequency") <= 2), "New Customer")
+    .when((col("recency_days") > 45) & (col("frequency") <= 3), "Churn Risk")
+    .otherwise("Standard")
 )
 
 # Write RFM dataset
@@ -162,36 +179,103 @@ rfm.write.mode("overwrite") \
 # -----------------------------------------
 # CHURN INDICATORS
 # -----------------------------------------
+from pyspark.sql.functions import (
+    min as _min,
+    max as _max,
+    sum as _sum,
+    count as _count,
+    avg as _avg,
+    datediff,
+    lag,
+    when,
+    round,
+    col
+)
+from pyspark.sql.window import Window
 
-from pyspark.sql.functions import min as _min, datediff, when, round
+# Base dataset: daily revenue per user
+daily = clv_daily.select("user_id", "order_date", "daily_revenue")
 
-# First order date per user
+# Days since last order
+last_order = (
+    daily
+    .groupBy("user_id")
+    .agg(_max("order_date").alias("last_order_date"))
+    .withColumn("days_since_last_order", datediff(current_date(), col("last_order_date")))
+)
+
+# First order date
 first_order = (
-    clv_daily
+    daily
     .groupBy("user_id")
     .agg(_min("order_date").alias("first_order_date"))
 )
 
-# Join RFM + first order date
+# Average gap between orders
+w = Window.partitionBy("user_id").orderBy("order_date")
+
+daily_with_gap = daily.withColumn(
+    "prev_order_date",
+    lag("order_date").over(w)
+).withColumn(
+    "gap_days",
+    datediff(col("order_date"), col("prev_order_date"))
+)
+
+avg_gap = (
+    daily_with_gap
+    .groupBy("user_id")
+    .agg(round(_avg("gap_days"), 2).alias("avg_gap_days"))
+)
+
+# % change in spend over last N periods (N = 3)
+w2 = Window.partitionBy("user_id").orderBy("order_date")
+
+daily_with_change = daily.withColumn(
+    "prev_revenue",
+    lag("daily_revenue").over(w2)
+).withColumn(
+    "pct_change_spend",
+    round((col("daily_revenue") - col("prev_revenue")) / col("prev_revenue"), 2)
+)
+
+pct_change = (
+    daily_with_change
+    .groupBy("user_id")
+    .agg(round(_avg("pct_change_spend"), 2).alias("avg_pct_change_spend"))
+)
+
+# Total spend & frequency (for churn scoring)
+totals = (
+    daily
+    .groupBy("user_id")
+    .agg(
+        _sum("daily_revenue").alias("total_spend"),
+        _count("order_date").alias("total_orders")
+    )
+)
+
+# Join all churn metrics
 churn = (
-    rfm
+    last_order
     .join(first_order, "user_id")
-    .withColumn("avg_order_value", round(col("monetary") / col("frequency"), 2))
-    .withColumn("days_since_first_order", datediff(current_date(), col("first_order_date")))
+    .join(avg_gap, "user_id", "left")
+    .join(pct_change, "user_id", "left")
+    .join(totals, "user_id")
 )
 
-# Churn risk classification
 churn = churn.withColumn(
-    "churn_risk",
-    when(col("recency") > 180, "High")
-    .when(col("recency") > 90, "Medium")
-    .otherwise("Low")
+    "total_spend",
+    round(col("total_spend"), 2)
 )
 
-# Churn flag (binary)
+# Churn Tag (based on inactivity thresholds)
 churn = churn.withColumn(
-    "churn_flag",
-    when(col("recency") > 180, 1).otherwise(0)
+    "churn_tag",
+    when(col("days_since_last_order") > 180, "High Risk")
+    .when(col("days_since_last_order") > 90, "Medium Risk")
+    .when(col("days_since_last_order") > 45, "At Risk")
+    .otherwise("Active")
 )
 
 # Write churn dataset
