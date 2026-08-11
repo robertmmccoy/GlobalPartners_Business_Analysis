@@ -1,0 +1,9 @@
+
+MSCK REPAIR TABLE sales_daily;
+MSCK REPAIR TABLE customer_clv_daily;
+MSCK REPAIR TABLE customer_clv_segmented;
+MSCK REPAIR TABLE customer_rfm;
+
+ 
+
+

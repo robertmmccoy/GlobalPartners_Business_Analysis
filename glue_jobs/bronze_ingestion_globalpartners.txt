@@ -1,0 +1,60 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.functions import year, month, dayofmonth
+
+## @params: [JOB_NAME]
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# JDBC connection options
+jdbc_options = {
+    "url": "jdbc:sqlserver://deacademy-sqlserver.cq36ouy2ifxx.us-east-1.rds.amazonaws.com:1433;databaseName=globalpartners",
+    "user": "admin",
+    "password": "AXG98aTU!",
+    "driver": "com.microsoft.sqlserver.jdbc.SQLServerDriver"
+}
+
+# --- ORDER ITEMS ---
+order_items_df = spark.read.format("jdbc").options(
+    **jdbc_options,
+    dbtable="dbo.order_items"
+).load()
+
+order_items_df = order_items_df.withColumn("year", year(order_items_df.creation_time_utc)) \
+                               .withColumn("month", month(order_items_df.creation_time_utc)) \
+                               .withColumn("day", dayofmonth(order_items_df.creation_time_utc))
+
+order_items_df.write.mode("overwrite").partitionBy("year","month","day").parquet(
+    "s3://globalpartners-bronze-robert/order_items/"
+)
+
+# --- ORDER ITEM OPTIONS ---
+order_item_options_df = spark.read.format("jdbc").options(
+    **jdbc_options,
+    dbtable="dbo.order_item_options"
+).load()
+
+order_item_options_df.write.mode("overwrite").parquet(
+    "s3://globalpartners-bronze-robert/order_item_options/"
+)
+
+# --- DATE DIM ---
+date_dim_df = spark.read.format("jdbc").options(
+    **jdbc_options,
+    dbtable="dbo.date_dim"
+).load()
+
+date_dim_df.write.mode("overwrite").parquet(
+    "s3://globalpartners-bronze-robert/date_dim/"
+)
+
+job.commit()

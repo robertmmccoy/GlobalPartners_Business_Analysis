@@ -1,0 +1,561 @@
+import sys
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.functions import col, sum as _sum, to_date, round, year
+from pyspark.sql.window import Window
+
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+silver_path = "s3://globalpartners-silver-robert/"
+gold_path = "s3://globalpartners-gold-robert/"
+
+# Read silver
+order_items = spark.read.parquet(silver_path + "order_items/")
+
+# Ensure order_date exists
+#order_items = order_items.withColumn(
+#    "order_date",
+#    to_date(col("creation_time_utc"))
+#)
+#exclude 2020 due to item_price anomolies
+order_items = order_items.withColumn(
+    "order_date",
+    to_date(col("creation_time_utc"))
+).filter(year("order_date") >= 2021)
+
+# Remove bad user_id rows
+order_items = order_items.filter(
+    col("user_id").isNotNull() & (col("user_id") != "")
+)
+
+# Compute revenue BEFORE grouping
+order_items = order_items.withColumn(
+    "line_revenue",
+    col("item_price").cast("double") * col("item_quantity").cast("double")
+)
+
+# -----------------------------------------
+# Daily CLV
+# -----------------------------------------
+clv_daily = (
+    order_items
+    .groupBy("user_id", "order_date")
+    .agg(_sum("line_revenue").alias("daily_revenue"))
+)
+
+# Round revenue for clean formatting
+clv_daily = clv_daily.withColumn(
+    "daily_revenue",
+    round(col("daily_revenue"), 2)
+)
+
+# Add cumulative LTV per user
+w = Window.partitionBy("user_id").orderBy("order_date") \
+          .rowsBetween(Window.unboundedPreceding, Window.currentRow)
+
+clv_daily = clv_daily.withColumn(
+    "cumulative_ltv",
+    round(_sum("daily_revenue").over(w), 2)   # <-- ROUND HERE
+)
+
+# IMPORTANT: Remove user_id from file before partitioning
+clv_daily_write = clv_daily.select(
+    "order_date",
+    "daily_revenue",
+    "cumulative_ltv",
+    "user_id"   # included only for partitioning, not inside file
+)
+
+# Write partitioned Parquet
+clv_daily_write.write.mode("overwrite") \
+    .partitionBy("user_id") \
+    .parquet(gold_path + "customer_clv_daily/")
+
+
+# -----------------------------------------
+# CLV SEGMENTATION (High / Medium / Low)
+# -----------------------------------------
+
+from pyspark.sql.functions import round, when
+
+# Compute total LTV per user
+clv_total = (
+    clv_daily
+    .groupBy("user_id")
+    .agg(_sum("daily_revenue").alias("total_ltv"))
+)
+
+# Round total LTV for clean formatting
+clv_total = clv_total.withColumn(
+    "total_ltv",
+    round(col("total_ltv"), 2)
+)
+
+# Determine thresholds
+percentiles = clv_total.toPandas()["total_ltv"].quantile([0.2, 0.8])
+low_cutoff = float(percentiles.loc[0.2])
+high_cutoff = float(percentiles.loc[0.8])
+
+# Add segment column
+clv_segmented = (
+    clv_total
+    .withColumn(
+        "segment",
+        when(col("total_ltv") >= high_cutoff, "High")
+        .when(col("total_ltv") >= low_cutoff, "Medium")
+        .otherwise("Low")
+    )
+)
+
+# Write segmentation dataset
+clv_segmented.write.mode("overwrite") \
+    .parquet(gold_path + "customer_clv_segmented/")
+
+# -----------------------------------------
+# RFM (Recency, Frequency, Monetary)
+# -----------------------------------------
+
+from pyspark.sql.functions import max as _max, count as _count
+
+# Monetary = total revenue per user
+monetary = (
+    clv_daily
+    .groupBy("user_id")
+    .agg(_sum("daily_revenue").alias("monetary"))
+)
+
+# Frequency = number of order days per user
+frequency = (
+    clv_daily
+    .groupBy("user_id")
+    .agg(_count("order_date").alias("frequency"))
+)
+
+# Recency = days since last order
+last_order = (
+    clv_daily
+    .groupBy("user_id")
+    .agg(_max("order_date").alias("last_order_date"))
+)
+
+from pyspark.sql.functions import current_date, datediff
+
+rfm = (
+    last_order
+    .join(frequency, "user_id")
+    .join(monetary, "user_id")
+    .withColumn("recency", datediff(current_date(), col("last_order_date")))
+)
+
+# Write RFM dataset
+rfm.write.mode("overwrite") \
+    .parquet(gold_path + "customer_rfm/")
+
+# -----------------------------------------
+# CHURN INDICATORS
+# -----------------------------------------
+
+from pyspark.sql.functions import min as _min, datediff, when, round
+
+# First order date per user
+first_order = (
+    clv_daily
+    .groupBy("user_id")
+    .agg(_min("order_date").alias("first_order_date"))
+)
+
+# Join RFM + first order date
+churn = (
+    rfm
+    .join(first_order, "user_id")
+    .withColumn("avg_order_value", round(col("monetary") / col("frequency"), 2))
+    .withColumn("days_since_first_order", datediff(current_date(), col("first_order_date")))
+)
+
+# Churn risk classification
+churn = churn.withColumn(
+    "churn_risk",
+    when(col("recency") > 180, "High")
+    .when(col("recency") > 90, "Medium")
+    .otherwise("Low")
+)
+
+# Churn flag (binary)
+churn = churn.withColumn(
+    "churn_flag",
+    when(col("recency") > 180, 1).otherwise(0)
+)
+
+# Write churn dataset
+churn.write.mode("overwrite") \
+    .parquet(gold_path + "customer_churn_indicators/")
+
+# -----------------------------------------
+# LOYALTY IMPACT 
+# -----------------------------------------
+
+from pyspark.sql.functions import (
+    sum as _sum, count as _count, when, round, col
+)
+
+# REMOVE CORRUPTED 2020 DATA
+order_items_filtered = order_items.filter(col("order_date") >= "2021-01-01")
+
+#  Identify loyalty orders using existing column
+order_items_loyalty = order_items_filtered.withColumn(
+    "is_discounted",
+    when(col("is_loyalty") == 1, 1).otherwise(0)
+)
+
+#  Loyalty metrics per user
+loyalty_metrics = (
+    order_items_loyalty
+    .groupBy("user_id")
+    .agg(
+        _count("order_id").alias("total_orders"),
+        _sum("line_revenue").alias("total_revenue_raw"),
+        _sum("is_discounted").alias("loyalty_orders"),
+        _sum(when(col("is_discounted") == 1, col("line_revenue")).otherwise(0)).alias("loyalty_revenue_raw")
+    )
+)
+
+#  Format revenue columns to 2 decimals
+loyalty_metrics = loyalty_metrics.withColumn(
+    "total_revenue",
+    round(col("total_revenue_raw"), 2)
+).withColumn(
+    "loyalty_revenue",
+    round(col("loyalty_revenue_raw"), 2)
+)
+
+#  Loyalty flag
+loyalty_metrics = loyalty_metrics.withColumn(
+    "loyalty_flag",
+    when(col("loyalty_orders") > 0, 1).otherwise(0)
+)
+
+#  Loyalty ratio
+loyalty_metrics = loyalty_metrics.withColumn(
+    "loyalty_ratio",
+    round(col("loyalty_orders") / col("total_orders"), 2)
+)
+
+#  Loyalty lift
+loyalty_metrics = loyalty_metrics.withColumn(
+    "loyalty_lift",
+    round(col("loyalty_revenue") / col("total_revenue"), 2)
+)
+
+# Write loyalty dataset
+loyalty_metrics.write.mode("overwrite") \
+    .parquet(gold_path + "loyalty_impact/")
+
+# -----------------------------------------
+# RESTAURANT PERFORMANCE
+# -----------------------------------------
+
+from pyspark.sql.functions import sum as _sum, count as _count, when, round, countDistinct
+
+# Ensure restaurant_id exists in order_items
+# (Your Silver layer already includes restaurant_id)
+
+# Add loyalty flag using is_loyalty
+order_items_rest = order_items.withColumn(
+    "is_discounted",
+    when(col("is_loyalty") == 1, 1).otherwise(0)
+)
+
+# Compute restaurant-level metrics
+restaurant_perf = (
+    order_items_rest
+    .groupBy("restaurant_id")
+    .agg(
+        _count("order_id").alias("total_orders"),
+        _sum("line_revenue").alias("total_revenue_raw"),
+        countDistinct("user_id").alias("unique_customers"),
+        _sum("is_discounted").alias("loyalty_orders"),
+        _sum(when(col("is_discounted") == 1, col("line_revenue")).otherwise(0)).alias("loyalty_revenue_raw")
+    )
+)
+
+# Format revenue columns
+restaurant_perf = restaurant_perf.withColumn(
+    "total_revenue",
+    round(col("total_revenue_raw"), 2)
+).withColumn(
+    "loyalty_revenue",
+    round(col("loyalty_revenue_raw"), 2)
+)
+
+# Average order value
+restaurant_perf = restaurant_perf.withColumn(
+    "avg_order_value",
+    round(col("total_revenue") / col("total_orders"), 2)
+)
+
+# Loyalty ratio
+restaurant_perf = restaurant_perf.withColumn(
+    "loyalty_ratio",
+    round(col("loyalty_orders") / col("total_orders"), 2)
+)
+
+# Loyalty lift
+restaurant_perf = restaurant_perf.withColumn(
+    "loyalty_lift",
+    round(col("loyalty_revenue") / col("total_revenue"), 2)
+)
+
+# Write dataset
+restaurant_perf.write.mode("overwrite") \
+    .parquet(gold_path + "restaurant_performance/")
+
+# -----------------------------------------
+# MENU CATEGORY PERFORMANCE
+# -----------------------------------------
+
+from pyspark.sql.functions import (
+    sum as _sum, count as _count, when, round, countDistinct,
+    regexp_replace, col, trim
+)
+
+# CLEAN CATEGORY FIELD FIRST
+order_items_clean = order_items.withColumn(
+    "item_category",
+    trim(regexp_replace("item_category", "https?://[^\\s]+", ""))
+)
+
+# Add loyalty flag using is_loyalty
+order_items_cat = order_items_clean.withColumn(
+    "is_discounted",
+    when(col("is_loyalty") == 1, 1).otherwise(0)
+)
+
+# Compute category-level metrics
+menu_cat_perf = (
+    order_items_cat
+    .groupBy("item_category")
+    .agg(
+        _count("order_id").alias("total_orders"),
+        _sum("line_revenue").alias("total_revenue_raw"),
+        countDistinct("user_id").alias("unique_customers"),
+        _sum("is_discounted").alias("loyalty_orders"),
+        _sum(when(col("is_discounted") == 1, col("line_revenue")).otherwise(0)).alias("loyalty_revenue_raw")
+    )
+)
+
+# Format revenue columns
+menu_cat_perf = menu_cat_perf.withColumn(
+    "total_revenue",
+    round(col("total_revenue_raw"), 2)
+).withColumn(
+    "loyalty_revenue",
+    round(col("loyalty_revenue_raw"), 2)
+)
+
+# Average order value
+menu_cat_perf = menu_cat_perf.withColumn(
+    "avg_order_value",
+    round(col("total_revenue") / col("total_orders"), 2)
+)
+
+# Loyalty ratio
+menu_cat_perf = menu_cat_perf.withColumn(
+    "loyalty_ratio",
+    round(col("loyalty_orders") / col("total_orders"), 2)
+)
+
+# Loyalty lift
+menu_cat_perf = menu_cat_perf.withColumn(
+    "loyalty_lift",
+    round(col("loyalty_revenue") / col("total_revenue"), 2)
+)
+
+# Write dataset
+menu_cat_perf.write.mode("overwrite") \
+    .parquet(gold_path + "menu_category_performance/")
+
+
+# -----------------------------------------
+# DISCOUNT EFFECTIVENESS
+# -----------------------------------------
+
+from pyspark.sql.functions import sum as _sum, count as _count, when, round
+
+# Add discount flag
+order_items_disc = order_items.withColumn(
+    "is_discounted",
+    when(col("is_loyalty") == 1, 1).otherwise(0)
+)
+
+# Aggregate discount vs non-discount metrics
+discount_effect = (
+    order_items_disc
+    .groupBy("is_discounted")
+    .agg(
+        _count("order_id").alias("total_orders"),
+        _sum("line_revenue").alias("total_revenue_raw")
+    )
+)
+
+# Format revenue
+discount_effect = discount_effect.withColumn(
+    "total_revenue",
+    round(col("total_revenue_raw"), 2)
+)
+
+# Split into discount vs non-discount
+discount_effect = discount_effect.withColumn(
+    "discount_type",
+    when(col("is_discounted") == 1, "Discounted").otherwise("Non-Discounted")
+)
+
+# Average order value
+discount_effect = discount_effect.withColumn(
+    "avg_order_value",
+    round(col("total_revenue") / col("total_orders"), 2)
+)
+
+# Now compute lift metrics using window functions
+from pyspark.sql.window import Window
+
+w = Window.rowsBetween(Window.unboundedPreceding, Window.unboundedFollowing)
+
+discount_effect = discount_effect.withColumn(
+    "total_revenue_all",
+    _sum("total_revenue").over(w)
+).withColumn(
+    "total_orders_all",
+    _sum("total_orders").over(w)
+)
+
+# Conversion rate
+discount_effect = discount_effect.withColumn(
+    "conversion_rate",
+    round(col("total_orders") / col("total_orders_all"), 2)
+)
+
+# Revenue share
+discount_effect = discount_effect.withColumn(
+    "revenue_share",
+    round(col("total_revenue") / col("total_revenue_all"), 2)
+)
+
+# Write dataset
+discount_effect.write.mode("overwrite") \
+    .parquet(gold_path + "discount_effectiveness/")
+
+# -----------------------------------------
+# SALES DAILY / WEEKLY / MONTHLY / YEARLY
+# -----------------------------------------
+
+from pyspark.sql.functions import (
+    sum as _sum,
+    count as _count,
+    round,
+    year,
+    month,
+    weekofyear
+)
+
+# Ensure order_date exists
+order_items_sales = order_items.withColumn(
+    "order_date",
+    to_date(col("creation_time_utc"))
+)
+
+# DAILY SALES
+sales_daily = (
+    order_items_sales
+    .groupBy("order_date")
+    .agg(
+        _count("order_id").alias("total_orders"),
+        _sum("line_revenue").alias("total_revenue_raw")
+    )
+)
+
+sales_daily = sales_daily.withColumn(
+    "total_revenue",
+    round(col("total_revenue_raw"), 2)
+).withColumn(
+    "avg_order_value",
+    round(col("total_revenue") / col("total_orders"), 2)
+)
+
+sales_daily.write.mode("overwrite") \
+    .parquet(gold_path + "sales_daily/")
+
+
+# WEEKLY SALES
+sales_weekly = (
+    order_items_sales
+    .groupBy(year("order_date").alias("year"), weekofyear("order_date").alias("week"))
+    .agg(
+        _count("order_id").alias("total_orders"),
+        _sum("line_revenue").alias("total_revenue_raw")
+    )
+)
+
+sales_weekly = sales_weekly.withColumn(
+    "total_revenue",
+    round(col("total_revenue_raw"), 2)
+).withColumn(
+    "avg_order_value",
+    round(col("total_revenue") / col("total_orders"), 2)
+)
+
+sales_weekly.write.mode("overwrite") \
+    .parquet(gold_path + "sales_weekly/")
+
+
+# MONTHLY SALES
+sales_monthly = (
+    order_items_sales
+    .groupBy(year("order_date").alias("year"), month("order_date").alias("month"))
+    .agg(
+        _count("order_id").alias("total_orders"),
+        _sum("line_revenue").alias("total_revenue_raw")
+    )
+)
+
+sales_monthly = sales_monthly.withColumn(
+    "total_revenue",
+    round(col("total_revenue_raw"), 2)
+).withColumn(
+    "avg_order_value",
+    round(col("total_revenue") / col("total_orders"), 2)
+)
+
+sales_monthly.write.mode("overwrite") \
+    .parquet(gold_path + "sales_monthly/")
+
+
+# YEARLY SALES
+sales_yearly = (
+    order_items_sales
+    .groupBy(year("order_date").alias("year"))
+    .agg(
+        _count("order_id").alias("total_orders"),
+        _sum("line_revenue").alias("total_revenue_raw")
+    )
+)
+
+sales_yearly = sales_yearly.withColumn(
+    "total_revenue",
+    round(col("total_revenue_raw"), 2)
+).withColumn(
+    "avg_order_value",
+    round(col("total_revenue") / col("total_orders"), 2)
+)
+
+sales_yearly.write.mode("overwrite") \
+    .parquet(gold_path + "sales_yearly/")
+
+job.commit()

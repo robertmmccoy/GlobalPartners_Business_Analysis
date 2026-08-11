@@ -1,0 +1,144 @@
+CREATE DATABASE globalpartners_gold;
+
+1. Daily Sales
+
+CREATE EXTERNAL TABLE IF NOT EXISTS globalpartners_gold.sales_daily (
+  order_date date,
+  daily_revenue double,
+  daily_active_customers int
+)
+PARTITIONED BY (
+  year int,
+  month int
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/sales_daily/';
+
+2. Weekly sales
+
+CREATE EXTERNAL TABLE IF NOT EXISTS globalpartners_gold.sales_weekly (
+  calendar_year int,
+  calendar_week int,
+  weekly_revenue double,
+  weekly_active_customers int
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/sales_weekly/';
+
+3. Monthly Sales
+
+CREATE EXTERNAL TABLE IF NOT EXISTS globalpartners_gold.sales_monthly (
+  calendar_year int,
+  calendar_month int,
+  monthly_revenue double,
+  monthly_active_customers int
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/sales_monthly/';
+
+4. Yearly sales
+
+CREATE EXTERNAL TABLE IF NOT EXISTS globalpartners_gold.sales_yearly (
+  calendar_year int,
+  yearly_revenue double,
+  yearly_active_customers int
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/sales_yearly/';
+
+5. Daily CLV
+
+CREATE EXTERNAL TABLE IF NOT EXISTS globalpartners_gold.customer_clv_daily (
+    order_date date,
+    daily_revenue double,
+    cumulative_ltv double
+)
+PARTITIONED BY (
+    user_id string
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/customer_clv_daily/';
+
+6. CLV segmented
+
+CREATE EXTERNAL TABLE IF NOT EXISTS globalpartners_gold.customer_clv_segmented (
+  user_id string,
+  total_ltv double,
+  clv_percentile double
+)
+PARTITIONED BY (
+  clv_segment string
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/customer_clv_segmented/';
+
+7. RFM segmentation
+
+CREATE EXTERNAL TABLE IF NOT EXISTS globalpartners_gold.customer_rfm (
+  user_id string,
+  last_order_date date,
+  frequency int,
+  monetary double,
+  recency_days int
+)
+PARTITIONED BY (
+  rfm_segment string
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/customer_rfm/';
+
+8. Churn indicators
+
+CREATE EXTERNAL TABLE IF NOT EXISTS globalpartners_gold.customer_churn_indicators (
+  user_id string,
+  last_order_date date,
+  avg_gap_days double,
+  total_spend double,
+  days_since_last_order int,
+  churn_tag string
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/customer_churn_indicators/';
+
+9. Loyalty impact
+
+CREATE EXTERNAL TABLE IF NOT EXISTS globalpartners_gold.loyalty_impact (
+  user_id string,
+  is_loyalty boolean,
+  total_spend double,
+  order_count int
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/loyalty_impact/';
+
+10. Restaurant performance
+
+CREATE EXTERNAL TABLE IF NOT EXISTS globalpartners_gold.restaurant_performance (
+  restaurant_id string,
+  total_revenue double,
+  avg_order_value double,
+  orders_count int
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/restaurant_performance/';
+
+11. Menu category performance
+
+CREATE EXTERNAL TABLE IF NOT EXISTS globalpartners_gold.menu_category_performance (
+  item_category string,
+  total_revenue double,
+  orders_count int
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/menu_category_performance/';
+
+
+12. Discount effectiveness
+
+CREATE EXTERNAL TABLE IF NOT EXISTS globalpartners_gold.discount_effectiveness (
+  has_discount boolean,
+  revenue double,
+  orders_count int
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/discount_effectiveness/';
