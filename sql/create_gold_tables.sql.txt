@@ -1,0 +1,173 @@
+CREATE DATABASE globalpartners_gold;
+
+1. customer_rfm
+
+CREATE EXTERNAL TABLE globalpartners_gold.customer_rfm (
+  user_id string,
+  last_order_date date,
+  frequency int,
+  monetary double,
+  recency_days int,
+  rfm_segment string
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/customer_rfm/';
+
+2. customer_churn_indicators
+
+CREATE EXTERNAL TABLE globalpartners_gold.customer_churn_indicators (
+  user_id string,
+  last_order_date date,
+  days_since_last_order int,
+  first_order_date date,
+  avg_gap_days double,
+  avg_pct_change_spend double,
+  total_spend double,
+  total_orders int,
+  churn_tag string
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/customer_churn_indicators/';
+
+
+3. customer_clv_daily
+
+CREATE EXTERNAL TABLE globalpartners_gold.customer_clv_daily (
+  order_date date,
+  daily_revenue double,
+  cumulative_ltv double
+)
+PARTITIONED BY (user_id string)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/customer_clv_daily/';
+
+
+4. customer_clv_segmented
+
+CREATE EXTERNAL TABLE globalpartners_gold.customer_clv_segmented (
+  user_id string,
+  total_ltv double,
+  segment string
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/customer_clv_segmented/';
+
+
+5. loyalty_impact
+
+CREATE EXTERNAL TABLE globalpartners_gold.loyalty_impact (
+  user_id string,
+  total_orders int,
+  total_revenue double,
+  loyalty_orders int,
+  loyalty_revenue double,
+  loyalty_flag int,
+  loyalty_ratio double,
+  loyalty_lift double
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/loyalty_impact/';
+
+
+6. restaurant_performance
+
+CREATE EXTERNAL TABLE globalpartners_gold.restaurant_performance (
+  restaurant_id string,
+  total_orders int,
+  total_revenue double,
+  unique_customers int,
+  loyalty_orders int,
+  loyalty_revenue double,
+  avg_order_value double,
+  loyalty_ratio double,
+  loyalty_lift double
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/restaurant_performance/';
+
+
+7. menu_category_performance
+
+CREATE EXTERNAL TABLE globalpartners_gold.menu_category_performance (
+  item_category string,
+  total_orders int,
+  total_revenue double,
+  unique_customers int,
+  loyalty_orders int,
+  loyalty_revenue double,
+  avg_order_value double,
+  loyalty_ratio double,
+  loyalty_lift double
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/menu_category_performance/';
+
+
+8. discount_effectiveness
+
+CREATE EXTERNAL TABLE globalpartners_gold.discount_effectiveness (
+  is_discounted int,
+  total_orders int,
+  total_revenue double,
+  discount_type string,
+  avg_order_value double,
+  total_revenue_all double,
+  total_orders_all double,
+  conversion_rate double,
+  revenue_share double
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/discount_effectiveness/';
+
+
+9. sales_daily
+
+CREATE EXTERNAL TABLE globalpartners_gold.sales_daily (
+  order_date date,
+  total_orders int,
+  total_revenue double,
+  avg_order_value double
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/sales_daily/';
+
+
+10. sales_weekly
+
+CREATE EXTERNAL TABLE globalpartners_gold.sales_weekly (
+  year int,
+  week int,
+  total_orders int,
+  total_revenue double,
+  avg_order_value double
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/sales_weekly/';
+
+
+11. sales_monthly
+
+CREATE EXTERNAL TABLE globalpartners_gold.sales_monthly (
+  year int,
+  month int,
+  total_orders int,
+  total_revenue double,
+  avg_order_value double
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/sales_monthly/';
+
+LOCATION 's3://globalpartners-gold-robert/menu_category_performance/';
+
+
+12. sales_yearly
+
+CREATE EXTERNAL TABLE globalpartners_gold.sales_yearly (
+  year int,
+  total_orders int,
+  total_revenue double,
+  avg_order_value double
+)
+STORED AS PARQUET
+LOCATION 's3://globalpartners-gold-robert/sales_yearly/';
+
